@@ -1,0 +1,147 @@
+#make sure ssh keys have been generated ssh-keygen
+
+#configure the microsoft azure provider
+provider "azurerm" {
+	version = "=1.30.1"
+}
+
+#define a prefix variable for the naming convention
+variable "prefix" {
+	default = "terraform"
+}
+
+#create resource group if it doesn't exist
+#"main" allows you to call attributes as variables later on
+resource "azurerm_resource_group" "main" {
+	name = "${var.prefix}-resources"
+	location = "uksouth"
+}
+
+#create virtual network
+resource "azurerm_virtual_network" "main" {
+	name = "${var.prefix}-network"
+	address_space = ["10.0.0.0/16"]
+	location = "${azurerm_resource_group.main.location}"
+	resource_group_name = "${azurerm_resource_group.main.name}"
+}
+
+#create subnet
+resource "azurerm_subnet" "internal" {
+	name = "${var.prefix}-subnet"
+	resource_group_name = "${azurerm_resource_group.main.name}"
+	virtual_network_name = "${azurerm_virtual_network.main.name}"
+	address_prefix = "10.0.1.0/24"
+}
+
+#create network security group
+resource "azurerm_network_security_group" "main" {
+        name = "${var.prefix}-NSG"
+        location = "${azurerm_resource_group.main.location}"
+        resource_group_name = "${azurerm_resource_group.main.name}"
+}
+
+#create nsg rules - look at nsg rule documentation
+resource "azurerm_network_security_rule" "jenkins" {
+	name = "jenkins"
+	priority = "500"
+	access = "Allow"
+	direction = "Inbound"
+	protocol = "Tcp"
+	source_port_range = "*"
+	destination_port_range = "8080"
+	source_address_prefix = "*"
+	destination_address_prefix = "*"
+	resource_group_name = "${azurerm_resource_group.main.name}"
+	network_security_group_name = "${azurerm_network_security_group.main.name}"
+}
+
+resource "azurerm_network_security_rule" "ssh" {
+        name = "SSH"
+        priority = "400"
+        access = "Allow"
+        direction = "Inbound"
+        protocol = "Tcp"
+        source_port_range = "*"
+        destination_port_range = "22"
+        source_address_prefix = "*"
+        destination_address_prefix = "*"
+        resource_group_name = "${azurerm_resource_group.main.name}"
+        network_security_group_name = "${azurerm_network_security_group.main.name}"
+
+}
+
+#create public ip
+resource "azurerm_public_ip" "main" {
+	name = "${var.prefix}-publicIP"
+	location = "${azurerm_resource_group.main.location}"
+	resource_group_name = "${azurerm_resource_group.main.name}"
+	domain_name_label = "jp-${var.prefix}-${formatdate("DDMMYYhhmmss", timestamp())}"
+	allocation_method = "Dynamic"
+	
+	tags = {
+		environment = "staging"
+	}
+}	
+
+#create network interface card
+resource "azurerm_network_interface" "main" {
+	name = "${var.prefix}-NIC"
+        location = "${azurerm_resource_group.main.location}"
+        resource_group_name = "${azurerm_resource_group.main.name}"
+	network_security_group_id = "${azurerm_network_security_group.main.id}"
+	ip_configuration {
+		name = "${var.prefix}-NICconfiguration"
+		subnet_id = "${azurerm_subnet.internal.id}"
+		private_ip_address_allocation = "dynamic"
+		public_ip_address_id = "${azurerm_public_ip.main.id}"
+	}
+}
+
+#create vm
+resource "azurerm_virtual_machine" "main" {
+	name = "${var.prefix}-vm"
+        location = "${azurerm_resource_group.main.location}"
+        resource_group_name = "${azurerm_resource_group.main.name}"
+	network_interface_ids = ["${azurerm_network_interface.main.id}"]
+	vm_size = "Standard_B1ms"
+        storage_image_reference {
+                publisher = "Canonical"
+                offer = "UbuntuServer"
+                sku = "16.04-LTS"
+                version = "latest"
+        }
+	storage_os_disk {
+		name = "${var.prefix}OsDisk"
+		caching = "ReadWrite"
+		create_option = "FromImage"
+		managed_disk_type = "Standard_LRS"
+	}
+	os_profile {
+		computer_name = "${var.prefix}"
+		admin_username = "admin123"
+		admin_password = "Password1234!"
+	}
+	os_profile_linux_config {
+		disable_password_authentication = true
+		ssh_keys {
+			path = "/home/admin123/.ssh/authorized_keys"
+			key_data = "${file("/home/johnny/.ssh/id_rsa.pub")}"
+	}
+}
+	tags = {
+		environment = "staging"
+	}
+
+
+
+#add provisioner to allow remote connection - updates and installs jq
+provisioner "remote-exec" {
+	inline = ["sudo apt update", "sudo apt install -y jq", "git clone https://github.com/JPeckoverQA/JenkinsScripts.git", "cd JenkinsScripts && ./install.sh"]
+	connection {
+		type = "ssh"
+		user = "admin123"
+		private_key = "${file("/home/johnny/.ssh/id_rsa")}"
+		host = "${azurerm_public_ip.main.fqdn}"
+}
+}
+}
